@@ -5,13 +5,16 @@ from xpinyin import Pinyin
 import dashscope
 import random
 from typing import Generator
-from http import HTTPStatus
+import requests
+from urllib import parse
+import uuid
+import os
 
 collection_name = "baidu_competition"
-EMBEDDING_DEVICE = "cuda"
+EMBEDDING_DEVICE = "cpu"
 dashscope.api_key = 'sk-0793fab51dbd44f1a3dbf2e0541990f9'
 p = Pinyin()
-limit = 2
+limit = 2  
 history = []
 all_query = ""
 embeddings = HuggingFaceEmbeddings(model_name="./m3e-base", model_kwargs={'device': EMBEDDING_DEVICE})
@@ -20,6 +23,33 @@ prompt = '### 角色与目标\n* 你是一个**专业的中式厨师和营养师
 client = MilvusClient(
     uri="http://114.212.97.40:19530",
 )
+
+def recipe_api(name : str) -> str:
+    search = name
+    search = "search?keyword=" + parse.quote(search) + "&num=10&start=1"
+    host = "http://jsucpdq.market.alicloudapi.com/recipe/"
+    url = parse.urljoin(host, search)
+    header = {
+        "Authorization": "APPCODE 79942dcf76664fb59347207c63b9593e"
+    }
+
+    try:
+        ans = requests.get(url=url, headers=header)
+        data = json.loads(ans.text)
+        data = data["result"]["list"][0]
+        string = ""
+        string += "菜名：" + data['name'] + "\n" + "预计用时:" + data['cookingtime'] + '\n' + '原料:' + '\n'
+        for item in data['material']:
+            string += item['amount'] + " " + item['mname'] + '\n'
+        string += "步骤:" + '\n'
+        for item in data["process"]:
+            string += item["pcontent"] + "\n"
+        if string == "":
+            return "None"
+        else:
+            return string
+    except:
+        return "None"
 
 def is_json(myjson):
     try:
@@ -31,7 +61,7 @@ def is_json(myjson):
 def partition_search_api(messages):
     query = messages[-1]['content']
     message = [
-        {'role': 'user', 'content': f'你是一名问题分类员，请你根据下面的问题告诉我用户想要询问的是烹>饪技巧还是菜谱还是定制食谱还是打招呼，只需要告诉我类别即可，不要返回其他任何东西。例如，若问题是>：土豆烧肉怎么做？请返回：菜谱。若问题是：怎么腌制猪肉？请返回：烹饪技巧。若问题是：我不吃辣，想>吃点海鲜，可以吃什么？请返回：定制食谱。若问题是：你好。请返回：打招呼。除此之外都请返回"未知"。>接下来请你对下面的问题进行分类：{query}'},]
+    {'role': 'user', 'content': f'你是一名问题分类员，请你根据下面的问题告诉我用户想要询问的是烹饪技巧还是菜谱还是定制食谱还是打招呼，只需要告诉我类别即可，不要返回其他任何东西。例如，若问题是：土豆烧肉怎么做？请返回：菜谱。若问题是：怎么腌制猪肉？请返回：烹饪技巧。若问题是：我不吃辣，想吃点海鲜，可以吃什么？请返回：定制食谱。若问题是：你好。请返回：打招呼。除此之外都请返回"未知"。接下来请你对下面的问题进行分类：{query}'},]
     response = dashscope.Generation.call(
         'qwen1.5-32b-chat',
         messages=message,
@@ -40,6 +70,7 @@ def partition_search_api(messages):
     )
     res = json.loads(str(response))['output']['text']
     partition = []
+    print(res)
     if res.find('烹饪技巧') != -1:
         embedding = embeddings.embed_documents([query])
         results = client.search(collection_name=collection_name, data=embedding, limit=limit, search_params={"metric_type": "COSINE", "params": {}}, output_fields=["file_path"], partition_names=['pengrenjiqiao'])
@@ -63,17 +94,27 @@ def partition_search_api(messages):
             results = client.search(collection_name=collection_name, data=embedding, limit=limit, search_params={"metric_type": "COSINE", "params": {}}, output_fields=["file_path"], partition_names=['caipu'])
             return [result['entity']['file_path'] for result in results[0]]
         res = json.loads(res)
+        resf = []
         for item in res:
             embedding = embeddings.embed_documents([item])
             results = client.search(collection_name=collection_name, data=embedding, limit=1, search_params={"metric_type": "COSINE", "params": {}}, output_fields=["file_path"], partition_names=['caipu'])
-            return [result['entity']['file_path'] for result in results[0]]
+            resf += [result['entity']['file_path'] for result in results[0]]
+            apires = recipe_api(item)
+            if not os.path.exists('temp'):
+                os.mkdir('temp')
+            if apires != "None":
+                tempf = 'temp/' + str(uuid.uuid4()) + '.txt'
+                with open(tempf, 'w', encoding='utf-8') as f:
+                    f.write(apires)
+                resf.append(tempf)
+        return resf
     elif res.find('定制食谱') != -1:
         queries = ""
         for message in messages:
             if message['role'] == 'user':
                 queries += message['content']
         message = [
-            {'role': 'user', 'content': f'你是一个**专业的中式厨师和营养师**，精通国内各种菜系和各地菜肴，请你根据下面的提问返回你能想到的所有的相关菜肴的名称，在中括号中给出，用逗号隔开。例如，当我问"土豆猪肉能做什么"请你返回["土豆烧肉", "土豆丝炒肉"]。请你针对下面的问题进行回答：{queries}'},]
+            {'role': 'user', 'content': f'你是一个**专业的中式厨师和营养师**，精通国内各种菜系和各地菜肴，请你根据下面的提问返回你能想到的所有的相关菜肴的名称，在中括号中给出，用逗号隔开。例如，当我问"我最近想减肥，能吃什么"你可以返回["蔬菜沙拉", "水煮鸡胸肉"]或者类似的答案。请你针对下面的问题进行回答：{queries}'},]
         response = dashscope.Generation.call(
             'qwen1.5-32b-chat',
             messages=message,
@@ -86,10 +127,20 @@ def partition_search_api(messages):
             results = client.search(collection_name=collection_name, data=embedding, limit=limit, search_params={"metric_type": "COSINE", "params": {}}, output_fields=["file_path"], partition_names=['caipu'])
             return [result['entity']['file_path'] for result in results[0]]
         res = json.loads(res)
+        resf = []
         for item in res:
             embedding = embeddings.embed_documents([item])
             results = client.search(collection_name=collection_name, data=embedding, limit=1, search_params={"metric_type": "COSINE", "params": {}}, output_fields=["file_path"], partition_names=['caipu'])
-            return [result['entity']['file_path'] for result in results[0]]
+            resf += [result['entity']['file_path'] for result in results[0]]
+            apires = recipe_api(item)
+            if not os.path.exists('temp'):
+                os.mkdir('temp')
+            if apires != "None":
+                tempf = 'temp/' + str(uuid.uuid4()) + '.txt'
+                with open(tempf, 'w', encoding='utf-8') as f:
+                    f.write(apires)
+                resf.append(tempf)
+        return resf
     elif res.find('打招呼') != -1:
         return []
     else:
@@ -98,26 +149,40 @@ def partition_search_api(messages):
         return [result['entity']['file_path'] for result in results[0]]
         
     
-
 def ask_stream(messages) -> Generator:
+    if messages[-1]["content"] == "已有食材怎么制作":
+        yield "请告诉我您目前有哪些可以用的食材，我会根据这些食材为你生成合适的菜谱。如果有一些口味需求也可以告诉我！"
+        return
+    if messages[-1]["content"] == "我想定制一个食谱":
+        yield "请告诉我您有什么需求或忌口，我会尽力给出一个满足需求的食谱。"
+        return
+    if messages[-1]["content"] == "能教我做一道菜吗":
+        yield "请问您想要我提供哪一道菜的菜谱？"
+        return
+    if messages[-1]["content"] == "我想学习烹饪技巧":
+        yield "请问您具体想要了解哪种烹饪技巧？或者在哪一步遇到了困难？"
+        return
     files = partition_search_api(messages)
     if not files:
         yield "您好，我是中式饮食专家。很高兴为您提供专业的中式烹饪方法和营养建议。无论您是想了解特定菜肴的做法，还是需要个性化的饮食方案，又或者想了解某个菜系、某种烹饪方法，我都能为您提供详尽的指导。让我们一起探索美食吧！\n试试问我：已有食材怎么制作 我想定制一个食谱 能教我做一道菜吗 我想学习烹饪技巧"
         return
     files_content = ""
     for file in files:
-        with open(file, 'r', encoding='utf-8') as f:
+        with open(file.replace('\\','/'), 'r', encoding='utf-8') as f:
             files_content += f.read()
     query_with_file = [
-        {'role': 'user', 'content': f'{files_content}\n请你依据以上提供的额外内容回答这个问题：{messages[-1]["content"]}\n如果以上内容无法确定答案，请抛弃以上提供的额外内容直接基于自己的知识回答用户的问题。不管我提供了什么内容，你在回答时都需要假装不知道我额外提供了一些参考内容，不要直接提及它们不要直接提>及它们，只专注于回答用户的问题。'},]
+        {'role': 'user', 'content': f'{files_content}\n请你将以上提供的额外内容作为补充知识回答这个问题：{messages[-1]["content"]}\n如果提供的额外内容和问题关系不大，请直接忽视提供的额外内容直接回答用户的问题。不管我提供了什么额外内容，你在回答时都禁止直接提及提供的额外内容，即禁止说类似“根据你提供的信息”“很抱歉，你提供的信息和问题无关”这样的语句，只专注于回答用户的问题，不要被额外信息干扰。'},]
     responses = dashscope.Generation.call(
         'qwen1.5-32b-chat',
-        messages=[{'role': 'system', 'content': prompt}] + messages[:-1] + query_with_file,
+        messages=[{'role': 'system', 'content': prompt}, {'role': 'user', 'content': '你好'}] + messages[:-1] + query_with_file,
         seed=random.randint(1, 10000),
         result_format='text',
         stream=True,
-        output_in_full=False,
+        incremental_output=True,
     )
     for response in responses:
-        if response.status_code == HTTPStatus.OK:
-            yield json.loads(str(response))['output']['text']  
+        #if not is_json(str(response)):
+        # print(str(response))
+        # return
+        # yield str([{'role': 'system', 'content': prompt}] + messages[:-1] + query_with_file) + str(response)
+        yield json.loads(str(response))['output']['text']  
